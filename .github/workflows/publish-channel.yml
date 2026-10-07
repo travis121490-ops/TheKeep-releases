@@ -1,0 +1,59 @@
+name: Publish verified channel
+run-name: Publish verified source run ${{ inputs.sourceRun }}
+on:
+  workflow_dispatch:
+    inputs:
+      sourceRun:
+        description: Derived by the private Release The Keep workflow; no owner transcription
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: official-channel
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require deliberate owner preparation on canonical main
+        env:
+          GH_TOKEN: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
+          SOURCE_RUN: ${{ inputs.sourceRun }}
+        run: |
+          set -eu
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]] || exit 1
+          gh api "repos/travis121490-ops/TheKeep/actions/runs/$SOURCE_RUN" > source-run.json
+          gh api "repos/travis121490-ops/TheKeep/actions/runs/$SOURCE_RUN/jobs" > source-jobs.json
+          python validate_channel.py --run source-run.json --jobs source-jobs.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-channel
+          repository: travis121490-ops/TheKeep
+          run-id: ${{ inputs.sourceRun }}
+          github-token: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
+          path: incoming
+      - name: Check immutable draft and verified static bytes
+        env:
+          GH_TOKEN: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
+        run: |
+          set -eu
+          code=$(python -c 'import json; print(int(json.load(open("incoming/release-evidence.json"))["identity"]["code"]))')
+          gh api "repos/travis121490-ops/TheKeep/releases/tags/keep-$code" > source-release.json
+          python validate_channel.py --run source-run.json --jobs source-jobs.json --incoming incoming --draft source-release.json --out channel
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: channel
+      - uses: actions/deploy-pages@v4
+        id: deploy
