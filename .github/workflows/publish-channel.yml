@@ -7,6 +7,11 @@ on:
         description: Derived by the private Release The Keep workflow; no owner transcription
         required: true
         type: string
+      verifyAccessOnly:
+        description: Verify protected cross-repository access without artifacts or deployment
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -14,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   publish:
-    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner
+    if: ${{ !inputs.verifyAccessOnly && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -57,3 +62,23 @@ jobs:
           path: channel
       - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
         id: deploy
+
+  verify-access:
+    if: ${{ inputs.verifyAccessOnly && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: github-pages
+    permissions:
+      contents: read
+    steps:
+      - name: Verify protected private-source Actions and Contents reads
+        env:
+          GH_TOKEN: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
+          SOURCE_RUN: ${{ inputs.sourceRun }}
+        run: |
+          set -eu
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]] || exit 1
+          gh api "repos/travis121490-ops/TheKeep/actions/runs/$SOURCE_RUN" --silent
+          gh api "repos/travis121490-ops/TheKeep/actions/runs/$SOURCE_RUN/jobs" --silent
+          gh api "repos/travis121490-ops/TheKeep/contents/README.md" --silent
+          echo 'PASS: protected source Actions/Contents reads; publication job skipped'
