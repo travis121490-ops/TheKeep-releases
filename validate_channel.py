@@ -26,6 +26,14 @@ def validate_run(run, jobs):
     require(len(prepared) == 1 and prepared[0]["conclusion"] == "success", "Source preparation has not passed")
 
 
+def select_draft(pages, code):
+    matches = [release for page in pages for release in page if release["tag_name"] == f"keep-{code}"]
+    require(len(matches) == 1, "Missing or ambiguous staged release")
+    draft = matches[0]
+    require(type(draft.get("id")) is int and draft["id"] > 0 and draft["draft"] is True and not draft["prerelease"], "Unfinished numeric draft required")
+    return draft
+
+
 def validate_channel(run, incoming, draft, out):
     incoming, out = Path(incoming), Path(out)
     require(not out.exists(), "Preserve existing output")

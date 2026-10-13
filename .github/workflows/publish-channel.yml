@@ -7,6 +7,10 @@ on:
         description: Derived by the private Release The Keep workflow; no owner transcription
         required: true
         type: string
+      draftReleaseId:
+        description: Numeric staged draft ID; never resolve an unpublished draft by tag endpoint
+        required: false
+        type: string
       verifyAccessOnly:
         description: Verify protected cross-repository access without artifacts or deployment
         required: false
@@ -52,10 +56,16 @@ jobs:
       - name: Check immutable draft and verified static bytes
         env:
           GH_TOKEN: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
+          DRAFT_RELEASE_ID: ${{ inputs.draftReleaseId }}
         run: |
           set -eu
           code=$(python -c 'import json; print(int(json.load(open("incoming/release-evidence.json"))["identity"]["code"]))')
-          gh api "repos/travis121490-ops/TheKeep/releases/tags/keep-$code" > source-release.json
+          if [ -z "$DRAFT_RELEASE_ID" ]; then
+            gh api --paginate --slurp "repos/travis121490-ops/TheKeep/releases?per_page=100" > source-releases.json
+            DRAFT_RELEASE_ID=$(python -c 'import json; from validate_channel import select_draft; print(select_draft(json.load(open("source-releases.json")), int(__import__("sys").argv[1]))["id"])' "$code")
+          fi
+          [[ "$DRAFT_RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          gh api "repos/travis121490-ops/TheKeep/releases/$DRAFT_RELEASE_ID" > source-release.json
           python validate_channel.py --run source-run.json --jobs source-jobs.json --incoming incoming --draft source-release.json --out channel
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
         with:
