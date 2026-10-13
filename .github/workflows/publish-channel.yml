@@ -11,6 +11,18 @@ on:
         description: Numeric staged draft ID; never resolve an unpublished draft by tag endpoint
         required: false
         type: string
+      recoveryRun:
+        description: Owner recovery run that privately validated the draft
+        required: false
+        type: string
+      receiptArtifactId:
+        description: Immutable validated-draft-1301 artifact ID from upload output
+        required: false
+        type: string
+      receiptDigest:
+        description: SHA-256 archive digest from upload output
+        required: false
+        type: string
       verifyAccessOnly:
         description: Verify protected cross-repository access without artifacts or deployment
         required: false
@@ -46,7 +58,20 @@ jobs:
           gh api "repos/travis121490-ops/TheKeep/actions/runs/$SOURCE_RUN" > source-run.json
           gh api "repos/travis121490-ops/TheKeep/actions/runs/$SOURCE_RUN/jobs" > source-jobs.json
           python validate_channel.py --run source-run.json --jobs source-jobs.json
+      - name: Validate private receipt and original immutable bytes
+        if: inputs.recoveryRun != ''
+        env:
+          GH_TOKEN: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
+          RECOVERY_RUN: ${{ inputs.recoveryRun }}
+          RECEIPT_ARTIFACT_ID: ${{ inputs.receiptArtifactId }}
+          RECEIPT_DIGEST: ${{ inputs.receiptDigest }}
+          DRAFT_RELEASE_ID: ${{ inputs.draftReleaseId }}
+        run: |
+          set -eu
+          [[ "$RECOVERY_RUN" =~ ^[1-9][0-9]*$ && "$RECEIPT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$DRAFT_RELEASE_ID" =~ ^[1-9][0-9]*$ && "$RECEIPT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          python validate_channel.py --run source-run.json --jobs source-jobs.json --recovery-run "$RECOVERY_RUN" --receipt-artifact-id "$RECEIPT_ARTIFACT_ID" --receipt-digest "$RECEIPT_DIGEST" --draft-release-id "$DRAFT_RELEASE_ID" --incoming incoming --out channel
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.recoveryRun == ''
         with:
           name: verified-channel
           repository: travis121490-ops/TheKeep
@@ -54,6 +79,7 @@ jobs:
           github-token: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
           path: incoming
       - name: Check immutable draft and verified static bytes
+        if: inputs.recoveryRun == ''
         env:
           GH_TOKEN: ${{ secrets.KEEP_SOURCE_READ_TOKEN }}
           DRAFT_RELEASE_ID: ${{ inputs.draftReleaseId }}
