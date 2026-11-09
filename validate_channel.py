@@ -131,11 +131,110 @@ def validate_receipt(receipt, recovery, jobs, source_run, source_jobs, recovery_
     return draft
 
 
+RELEASE_ASSETS = {"channel.zip", "release-evidence.json", "trusted-bootstrap.zip"}
+RELEASE_RECEIPT_STEPS = ("Validate staged draft receipt", "Seal validated draft receipt")
+RUN_IDENTITY = ("id", "head_sha", "run_attempt", "status", "event", "head_branch", "path", "actor", "triggering_actor")
+
+
+def actions_api(path):
+    return subprocess.run(["gh", "api", f"repos/{SOURCE}/actions/{path}"], check=True, capture_output=True).stdout
+
+
+def receipt_name(attempt):
+    return f"validated-draft-attempt-{attempt}"
+
+
+def read_receipt(raw):
+    require(len(raw) <= 1_000_000, "Receipt archive too large")
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        entries = archive.infolist()
+        require(len(entries) == 1 and entries[0].filename == "validated-draft-receipt.json" and
+                entries[0].file_size <= 500_000 and not entries[0].is_dir() and
+                (entries[0].external_attr >> 16) & 0o170000 != 0o120000, "Unexpected receipt archive")
+        return json.loads(archive.read(entries[0]).decode("utf-8-sig"))
+
+
+def validate_release_receipt(receipt, run, jobs, release_id):
+    """The ordinary release: the owner's own Release The Keep run validated its staged draft and sealed this receipt."""
+    validate_run(run, jobs)
+    require(run["status"] == "in_progress" and type(run["run_attempt"]) is int and run["run_attempt"] >= 1,
+            "Release run is not publishing")
+    producers = [job for job in jobs["jobs"] if job["name"] == "publish"]
+    require(len(producers) == 1 and producers[0]["run_id"] == run["id"] and producers[0]["run_attempt"] == run["run_attempt"],
+            "Ambiguous receipt producer job")
+    for name in RELEASE_RECEIPT_STEPS:
+        steps = [step for step in producers[0]["steps"] if step["name"] == name]
+        require(len(steps) == 1 and steps[0]["status"] == "completed" and steps[0]["conclusion"] == "success",
+                "Receipt producer validation/upload incomplete")
+    expected = dict(format=2, source=run["head_sha"], producerRun=run["id"], producerAttempt=run["run_attempt"],
+                    releaseId=release_id)
+    require(type(release_id) is int and release_id > 0 and all(receipt.get(k) == v for k, v in expected.items()),
+            "Receipt identity mismatch")
+    require(type(receipt.get("channelArtifactId")) is int and receipt["channelArtifactId"] > 0 and
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("channelArtifactDigest"))), "Receipt artifact identity missing")
+    draft = receipt["draft"]
+    require(draft["id"] == release_id and draft["draft"] is True and draft["prerelease"] is False and
+            re.fullmatch(r"keep-[1-9][0-9]*", draft["tag_name"]) and draft["target_commitish"] == run["head_sha"],
+            "Receipt draft mismatch")
+    assets = draft["assets"]
+    require(len(assets) == len(RELEASE_ASSETS) and {a["name"] for a in assets} == RELEASE_ASSETS, "Draft asset substitution")
+    for asset in assets:
+        require(type(asset["id"]) is int and asset["id"] > 0 and type(asset["size"]) is int and asset["size"] > 0 and
+                re.fullmatch(r"sha256:[0-9a-f]{64}", asset["digest"]), "Draft asset identity/digest mismatch")
+    return draft
+
+
+def consume_release_handoff(run, jobs, artifact_id, digest, release_id, incoming, out, api):
+    # Only Actions endpoints: the restricted channel credential never reads a private Release.
+    def get(path):
+        return json.loads(api(path))
+    current = get(f"runs/{run['id']}")
+    require(all(current[k] == run[k] for k in RUN_IDENTITY), "Release run changed before handoff")
+    jobs = get(f"runs/{run['id']}/jobs?per_page=100")
+    metadata = get(f"artifacts/{artifact_id}")
+    raw = api(f"artifacts/{artifact_id}/zip")
+    validate_archive(metadata, raw, artifact_id, digest, receipt_name(run["run_attempt"]), run["id"], run["head_sha"])
+    receipt = read_receipt(raw)
+    draft = validate_release_receipt(receipt, run, jobs, release_id)
+    channel_id, channel_digest = receipt["channelArtifactId"], receipt["channelArtifactDigest"].removeprefix("sha256:")
+    metadata = get(f"artifacts/{channel_id}")
+    raw = api(f"artifacts/{channel_id}/zip")
+    validate_archive(metadata, raw, channel_id, channel_digest, "verified-channel", run["id"], run["head_sha"])
+    incoming = Path(incoming)
+    require(not incoming.exists(), "Preserve incoming evidence")
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        entries = archive.infolist()
+        require(len(entries) == 2 and {e.filename for e in entries} == {"channel.zip", "release-evidence.json"} and
+                sum(e.file_size for e in entries) <= 1_000_000_000 and
+                all(not e.is_dir() and (e.external_attr >> 16) & 0o170000 != 0o120000 for e in entries),
+                "Unexpected verified channel artifact")
+        incoming.mkdir()
+        archive.extractall(incoming)
+    evidence = json.loads((incoming / "release-evidence.json").read_text(encoding="utf-8-sig"))
+    require(receipt["signedFiles"] == evidence["files"], "Signed inventory mismatch")
+    # The staged draft's own assets must be exactly the verified signed bytes this run produced.
+    by_name = {asset["name"]: asset for asset in draft["assets"]}
+    for name in ("channel.zip", "release-evidence.json"):
+        data = (incoming / name).read_bytes()
+        require(by_name[name]["size"] == len(data) and by_name[name]["digest"] == "sha256:" + hashlib.sha256(data).hexdigest(),
+                "Staged draft differs from verified signed bytes")
+    # The installer trust anchor becomes an official asset too: bind it to the hash the signed build recorded.
+    boots = [a for a in evidence.get("artifacts", []) if a.get("name") == "trusted-bootstrap.zip"]
+    boot = by_name["trusted-bootstrap.zip"]
+    require(len(boots) == 1 and boot["size"] == boots[0].get("size") and boot["digest"] == "sha256:" + str(boots[0].get("sha256")),
+            "Staged trusted bootstrap differs from signed evidence")
+    validate_channel(run, incoming, draft, out)
+    # Refuse a rerun or completion that occurred during retrieval, before Pages upload.
+    current = get(f"runs/{run['id']}")
+    require(all(current[k] == run[k] for k in RUN_IDENTITY), "Release run changed during handoff")
+
+
 def consume_handoff(source_run, source_jobs, recovery_id, artifact_id, digest, release_id, incoming, out, api=None):
     # Only Actions endpoints: the restricted channel credential never reads a private Release.
     if api is None:
-        def api(path):
-            return subprocess.run(["gh", "api", f"repos/{SOURCE}/actions/{path}"], check=True, capture_output=True).stdout
+        api = actions_api
+    if recovery_id == source_run["id"]:
+        return consume_release_handoff(source_run, source_jobs, artifact_id, digest, release_id, incoming, out, api)
     def get(path):
         return json.loads(api(path))
     recovery = get(f"runs/{recovery_id}")

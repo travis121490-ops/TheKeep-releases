@@ -12,11 +12,11 @@ on:
         required: false
         type: string
       recoveryRun:
-        description: Owner recovery run that privately validated the draft
+        description: Owner run that privately validated the draft (this release run, or the bounded 1301 recovery)
         required: false
         type: string
       receiptArtifactId:
-        description: Immutable validated-draft-1301 artifact ID from upload output
+        description: Immutable validated draft receipt artifact ID from upload output
         required: false
         type: string
       receiptDigest:
